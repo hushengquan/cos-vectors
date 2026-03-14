@@ -1,0 +1,652 @@
+# OpenClaw Skill 语义检索：复现指南
+
+> 本文档目标：让任何 OpenClaw 用户都能从零复现 Skill 语义检索能力。
+> 将本文档发给 OpenClaw（AI 助手），它可以全程自动完成部署。
+
+---
+
+## 背景
+
+OpenClaw 默认会把所有已安装 Skill 的 name + description 完整注入到每轮对话的 system prompt 里。
+当 Skill 数量较多时（如 59 个，约 4,867 tokens/轮），会带来以下问题：
+
+- **token 浪费**：每轮对话固定消耗大量 token 在 Skill 列表上
+- **上下文污染**：无关信息干扰 LLM 对工具的判断
+- **成本放大**：高频调用场景下累计成本显著增加
+
+**语义检索方案**：每次用户消息到达时，先用向量检索找出最相关的 Top-K 个 Skill，
+通过动态过滤大幅减少注入 system prompt 的 Skill 数量，从而降低 token 消耗。
+整个过程无需修改 OpenClaw 核心代码。
+
+---
+
+## 技术架构
+
+```
+用户消息到达
+    ↓
+[message:received hook] skill-router 触发
+    ↓
+Python 向量化用户查询（text2vec ONNX 本地模型）
+    ↓
+COS Vectors 检索 Top-5 相关 Skills（cosine 距离）
+    ↓
+写入 openclaw.json agents.<name>.skills = [Top-5 names]
+    ↓
+SIGUSR1 热重载 Gateway config
+    ↓
+LLM 收到消息时，system prompt 只包含 Top-5 精选 Skills
+```
+
+### 核心组件
+
+| 组件 | 说明 |
+|------|------|
+| **Embedding 模型** | `shibing624/text2vec-base-chinese`（ONNX 量化版，768 维，本地推理） |
+| **向量存储与检索** | 腾讯云 COS Vectors（通过 cos-vectors-skill 操作） |
+| **cos-vectors-skill** | 封装 COS Vectors 完整 CRUD，提供 16 个操作脚本 |
+| **索引构建脚本** | `build_skill_index.py`（离线，将所有 SKILL.md 向量化并写入向量桶） |
+| **在线检索脚本** | `retrieve_skills.py`（每次消息触发，查询 Top-K 相关 Skill） |
+| **Hook** | `skill-router`（监听 `message:received`，检索 → 写 config → 热重载） |
+| **配置路径** | `/projects/.openclaw/openclaw.json` |
+
+### COS Vectors 索引参数
+
+| 参数 | 值 |
+|------|-----|
+| 维度 | 768（对应 text2vec-base-chinese 输出） |
+| 距离度量 | cosine |
+| 距离阈值 | < 0.72（超过则认为无相关 Skill） |
+
+---
+
+## 部署步骤
+
+### 第一步：安装 cos-vectors-skill
+
+cos-vectors-skill 封装了 COS Vectors 的完整操作能力，包括向量桶/索引管理、向量数据 CRUD 等。
+本方案所有与 COS Vectors 的交互（创建索引、写入向量、查询向量）均通过此 skill 完成。
+
+从clawhub安装，skill链接地址是： https://clawhub.ai/jimmyyan/cos-vectors-skill
+如果失败，尝试从skillhub安装，先安装skillhub: curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh | bash
+再安装cos-vectors-skill: skillhub install cos-vectors-skill
+
+安装完成后，在 OpenClaw 中确认 skill 可用：
+
+```bash
+openclaw skills list | grep cos-vector
+```
+
+> **说明**：cos-vectors-skill 提供 16 个操作脚本，覆盖向量桶、索引、向量数据的完整 CRUD，
+> 以及查询、过滤、批量操作等能力。后续步骤中的创建索引和查询操作均基于此 skill。
+
+### 第二步：准备 COS 向量桶并创建索引
+
+配置 cos-vectors-skill 所需的 COS 凭据（SecretId / SecretKey）。
+然后通过 cos-vectors-skill 创建向量索引：
+
+1. 在 OpenClaw 中对话，要求它用 cos-vectors-skill 创建索引：
+
+   > 请用 cos-vectors-skill 在 bucket `<your-bucket>` 中创建一个向量索引，
+   > 索引名 `skill-index-768`，维度 768，距离度量 cosine。
+
+2. 记录 Bucket 名称（含 APPID 后缀）、Region 和 Index 名。
+
+> **前置条件**：需要一个已开通向量功能的 COS Bucket。
+> 如还未创建，登录[腾讯云控制台](https://console.cloud.tencent.com/cos)新建 Bucket 并开通向量检索功能。
+
+### 第三步：安装 Embedding 环境
+
+选用本地模型，无外部依赖，无数据外泄风险：
+
+```bash
+pip3 install "sentence-transformers[onnx]" cos-python-sdk-v5
+```
+
+下载模型（通过 HuggingFace Mirror，约 200MB）：
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('shibing624/text2vec-base-chinese')
+"
+```
+
+> **重要**：必须使用 ONNX 后端加载模型。直接用 PyTorch 方式加载耗时较长，
+> 在 exec 环境中可能因超时被 SIGTERM kill。ONNX 量化版推理约 1.6 秒处理 59 条，稳定可靠。
+
+验证模型加载：
+
+```python
+from sentence_transformers import SentenceTransformer
+import pathlib
+
+cache_dir = pathlib.Path.home() / ".cache/huggingface/hub"
+snapshot = next((cache_dir / "models--shibing624--text2vec-base-chinese" / "snapshots").iterdir())
+
+model = SentenceTransformer(
+    str(snapshot),
+    backend="onnx",
+    model_kwargs={"file_name": "onnx/model_qint8_avx512_vnni.onnx"},
+)
+vec = model.encode(["测试"], normalize_embeddings=True)
+print(f"维度: {len(vec[0])}")  # 应输出 768
+```
+
+### 第四步：部署脚本
+
+#### 4.1 创建目录
+
+```bash
+mkdir -p ~/workspace/scripts
+```
+
+#### 4.2 离线构建脚本 `build_skill_index.py`
+
+保存为 `~/workspace/scripts/build_skill_index.py`。
+
+此脚本通过 cos-vectors-skill 的底层 SDK（`CosVectorsClient`）写入向量数据，
+与 skill 使用完全相同的 COS Vectors API：
+
+```python
+#!/usr/bin/env python3
+"""
+build_skill_index.py — 离线构建 Skill 向量索引
+
+扫描所有 SKILL.md，向量化后通过 COS Vectors API 写入向量桶。
+每次安装新 Skill 后重跑此脚本即可增量更新。
+
+用法：python3 build_skill_index.py
+"""
+
+import os
+import re
+import sys
+import pathlib
+import yaml
+from sentence_transformers import SentenceTransformer
+from qcloud_cos import CosConfig, CosVectorsClient
+
+# ── 配置（修改这里）──────────────────────────────────────────────────────────
+SECRET_ID    = "YOUR_SECRET_ID"
+SECRET_KEY   = "YOUR_SECRET_KEY"
+BUCKET       = "your-bucket-1234567890"
+INDEX        = "skill-index-768"
+REGION       = "ap-guangzhou"
+DOMAIN       = f"vectors.{REGION}.coslake.com"
+
+# Skill 扫描目录
+SKILL_DIRS = [
+    pathlib.Path("/usr/local/lib/.nvm/versions/node/v22.17.0/lib/node_modules/openclaw/skills"),
+    pathlib.Path("/projects/.openclaw/skills"),
+]
+
+# ── 找到模型快照路径 ──────────────────────────────────────────────────────────
+def find_model_snapshot() -> pathlib.Path:
+    cache = pathlib.Path.home() / ".cache/huggingface/hub"
+    snaps = cache / "models--shibing624--text2vec-base-chinese" / "snapshots"
+    return next(snaps.iterdir())
+
+# ── 加载 ONNX 模型 ────────────────────────────────────────────────────────────
+print("加载 ONNX 模型...")
+MODEL_SNAPSHOT = find_model_snapshot()
+model = SentenceTransformer(
+    str(MODEL_SNAPSHOT),
+    backend="onnx",
+    model_kwargs={"file_name": "onnx/model_qint8_avx512_vnni.onnx"},
+)
+
+# ── COS Vectors 客户端（与 cos-vectors-skill 使用相同的接口）────────────────
+_cfg    = CosConfig(Region=REGION, SecretId=SECRET_ID, SecretKey=SECRET_KEY,
+                    Scheme="https", Domain=DOMAIN)
+vclient = CosVectorsClient(_cfg)
+
+# ── 收集所有 SKILL.md ─────────────────────────────────────────────────────────
+def collect_skills():
+    skills = []
+    for base in SKILL_DIRS:
+        if not base.exists():
+            continue
+        for skill_md in sorted(base.rglob("SKILL.md")):
+            name    = skill_md.parent.name
+            content = skill_md.read_text(encoding="utf-8")
+            # 提取 YAML frontmatter 里的 description（优先）
+            description = ""
+            if content.startswith("---"):
+                end = content.find("---", 3)
+                if end != -1:
+                    try:
+                        meta = yaml.safe_load(content[3:end])
+                        description = meta.get("description", "") or ""
+                    except Exception:
+                        pass
+            text = f"{name}\n{description}" if description else name
+            skills.append({"name": name, "text": text})
+    return skills
+
+# ── 向量化并写入 ──────────────────────────────────────────────────────────────
+print("扫描 SKILL.md...")
+skills = collect_skills()
+print(f"找到 {len(skills)} 个 skill")
+
+texts = [s["text"] for s in skills]
+print("向量化中（约 1~2 秒）...")
+embeddings = model.encode(texts, normalize_embeddings=True, show_progress_bar=True)
+
+vectors = []
+for i, sk in enumerate(skills):
+    key = re.sub(r"[^a-zA-Z0-9\-_.]", "_", f"skill:{sk['name']}")[:100]
+    vectors.append({
+        "key":      key,
+        "data":     {"float32": embeddings[i].tolist()},
+        "metadata": {"name": sk["name"]},
+    })
+
+# 分批写入（每批最多 100 条）
+# 注意：这里使用的是与 cos-vectors-skill 相同的 put_vectors API
+BATCH = 100
+for i in range(0, len(vectors), BATCH):
+    batch = vectors[i:i + BATCH]
+    end   = min(i + BATCH, len(vectors))
+    print(f"写入向量 {i+1}~{end}/{len(vectors)}...", end="", flush=True)
+    vclient.put_vectors(Bucket=BUCKET, Index=INDEX, Vectors=batch)
+    print(" ✓")
+
+print(f"\n✅ 全部完成！共上传 {len(vectors)} 个 skill 向量到 {BUCKET}/{INDEX}")
+```
+
+#### 4.3 在线检索脚本 `retrieve_skills.py`
+
+保存为 `~/workspace/scripts/retrieve_skills.py`。
+
+此脚本使用与 cos-vectors-skill 相同的 `query_vectors` API 完成相似度检索：
+
+```python
+#!/usr/bin/env python3
+"""
+retrieve_skills.py — 在线检索相关 Skills
+
+使用 COS Vectors query_vectors API（与 cos-vectors-skill 相同接口）进行语义检索。
+
+用法：python3 retrieve_skills.py "用户查询" [--top-k=5] [--json]
+"""
+
+import sys
+import re
+import json
+import pathlib
+from sentence_transformers import SentenceTransformer
+from qcloud_cos import CosConfig, CosVectorsClient
+
+# ── 配置（修改这里）──────────────────────────────────────────────────────────
+SECRET_ID  = "YOUR_SECRET_ID"
+SECRET_KEY = "YOUR_SECRET_KEY"
+BUCKET     = "your-bucket-1234567890"
+INDEX      = "skill-index-768"
+REGION     = "ap-guangzhou"
+DOMAIN     = f"vectors.{REGION}.coslake.com"
+
+DISTANCE_THRESHOLD = 0.72   # 超过此值则认为无相关 Skill
+
+# ── 模型（单例，避免重复加载）────────────────────────────────────────────────
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        cache  = pathlib.Path.home() / ".cache/huggingface/hub"
+        snaps  = cache / "models--shibing624--text2vec-base-chinese" / "snapshots"
+        snap   = next(snaps.iterdir())
+        _model = SentenceTransformer(
+            str(snap),
+            backend="onnx",
+            model_kwargs={"file_name": "onnx/model_qint8_avx512_vnni.onnx"},
+        )
+    return _model
+
+# ── COS Vectors 客户端 ────────────────────────────────────────────────────────
+_cfg    = CosConfig(Region=REGION, SecretId=SECRET_ID, SecretKey=SECRET_KEY,
+                    Scheme="https", Domain=DOMAIN)
+vclient = CosVectorsClient(_cfg)
+
+# ── 检索函数（使用 cos-vectors-skill 的 query_vectors 接口）─────────────────
+def retrieve_skills(query: str, top_k: int = 5) -> list:
+    model = get_model()
+    vec   = model.encode([query], normalize_embeddings=True)[0].tolist()
+
+    _, data = vclient.query_vectors(
+        Bucket=BUCKET, Index=INDEX,
+        QueryVector={"float32": vec},
+        TopK=top_k,
+        ReturnDistance=True,
+        ReturnMetaData=True,
+    )
+
+    results = []
+    for item in data.get("vectors", []):
+        meta     = item.get("metadata") or {}
+        name     = meta.get("name") or item.get("key", "")
+        distance = round(item.get("distance", 1.0), 4)
+        if distance > DISTANCE_THRESHOLD:
+            continue
+        results.append({"name": name, "distance": distance})
+
+    return results
+
+# ── 入口 ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    args    = sys.argv[1:]
+    query   = next((a for a in args if not a.startswith("--")), "")
+    top_k   = int(next((a.split("=")[1] for a in args if a.startswith("--top-k=")), "5"))
+    as_json = "--json" in args
+
+    if not query:
+        print("用法: python3 retrieve_skills.py \"查询内容\" [--top-k=5] [--json]",
+              file=sys.stderr)
+        sys.exit(1)
+
+    results = retrieve_skills(query, top_k)
+
+    if as_json:
+        print(json.dumps(results, ensure_ascii=False))
+    else:
+        if not results:
+            print(f"未找到相关 Skill（所有距离 > {DISTANCE_THRESHOLD}）")
+        else:
+            for r in results:
+                print(f"  {r['name']:<30} distance={r['distance']}")
+```
+
+### 第五步：修改脚本配置
+
+打开两个脚本，替换顶部配置：
+
+```python
+SECRET_ID  = "YOUR_SECRET_ID"           # 你的腾讯云 SecretId
+SECRET_KEY = "YOUR_SECRET_KEY"          # 你的腾讯云 SecretKey
+BUCKET     = "your-bucket-1234567890"   # COS Bucket 名称（含 APPID 后缀）
+REGION     = "ap-guangzhou"             # Bucket 所在地域
+INDEX      = "skill-index-768"          # 第二步创建的 Index 名
+```
+
+### 第六步：构建向量索引
+
+```bash
+python3 ~/workspace/scripts/build_skill_index.py
+```
+
+预期输出：
+```
+加载 ONNX 模型...
+扫描 SKILL.md...
+找到 59 个 skill
+向量化中（约 1~2 秒）...
+写入向量 1~59/59... ✓
+
+✅ 全部完成！共上传 59 个 skill 向量到 your-bucket-1234567890/skill-index-768
+```
+
+验证检索效果：
+```bash
+python3 ~/workspace/scripts/retrieve_skills.py "帮我查代码仓库"
+# 预期：github  distance=0.21 ...
+
+python3 ~/workspace/scripts/retrieve_skills.py "今天深圳天气怎么样"
+# 预期：weather  distance=0.18 ...
+```
+
+也可以通过 cos-vectors-skill 查询已写入的向量数量来验证索引状态：
+
+> 请用 cos-vectors-skill 列出 bucket `<your-bucket>` 中 `skill-index-768` 索引的向量数量。
+
+### 第七步：编写 skill-router Hook
+
+#### 7.1 Hook 目录结构
+
+```
+~/workspace/hooks/skill-router/
+├── HOOK.md       # 声明监听的事件
+└── handler.ts    # 检索 → 写 config → 热重载
+```
+
+#### 7.2 HOOK.md
+
+保存为 `~/workspace/hooks/skill-router/HOOK.md`：
+
+```markdown
+---
+name: skill-router
+description: 在每条消息处理前，语义检索最相关的 Skills 并动态更新 Gateway config
+events:
+  - message:received
+---
+```
+
+#### 7.3 handler.ts
+
+保存为 `~/workspace/hooks/skill-router/handler.ts`：
+
+```typescript
+import { execSync } from "child_process";
+import { readFileSync, writeFileSync } from "fs";
+
+// ── 配置 ──────────────────────────────────────────────────────────────────────
+const RETRIEVE_SCRIPT = `${process.env.HOME}/workspace/scripts/retrieve_skills.py`;
+const CONFIG_PATH     = "/projects/.openclaw/openclaw.json";
+const AGENT_NAME      = "marcus";       // 替换为你的 Agent 名称
+const TOP_K           = 5;
+const DISTANCE_THRESHOLD = 0.72;
+const DEBOUNCE_MS     = 3000;           // 3 秒内同一会话不重复检索
+
+// ── 防抖状态 ──────────────────────────────────────────────────────────────────
+const lastRetrieveTime: Record<string, number> = {};
+
+// ── Hook 处理函数 ─────────────────────────────────────────────────────────────
+export const handler = async (event: any) => {
+  if (event.type !== "message" || event.action !== "received") return;
+
+  const content        = event.context?.content ?? "";
+  const conversationId = event.context?.conversationId ?? "default";
+  if (!content) return;
+
+  // 防抖
+  const now = Date.now();
+  if (now - (lastRetrieveTime[conversationId] ?? 0) < DEBOUNCE_MS) return;
+  lastRetrieveTime[conversationId] = now;
+
+  try {
+    // 1. 向量检索（调用 retrieve_skills.py，底层使用与 cos-vectors-skill 相同的 query_vectors API）
+    const raw     = execSync(
+      `python3 ${RETRIEVE_SCRIPT} ${JSON.stringify(content)} --top-k=${TOP_K} --json`,
+      { timeout: 10000 }
+    ).toString();
+    const skills: Array<{ name: string; distance: number }> = JSON.parse(raw);
+    const relevant = skills
+      .filter(s => s.distance < DISTANCE_THRESHOLD)
+      .map(s => s.name);
+
+    if (relevant.length === 0) return;  // 无相关 Skill，不修改 config
+
+    // 2. 读取并更新 openclaw.json
+    const cfg    = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+    const agents = cfg?.agents?.list ?? [];
+    const idx    = agents.findIndex((a: any) => a.name === AGENT_NAME);
+    if (idx === -1) {
+      console.error(`[skill-router] 找不到 Agent: ${AGENT_NAME}`);
+      return;
+    }
+    agents[idx].skills = relevant;
+    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+
+    // 3. 热重载 Gateway（SIGUSR1）
+    execSync("kill -USR1 $(pgrep -f 'openclaw-gateway' | head -1)");
+
+    console.log(`[skill-router] 已更新 Skills: [${relevant.join(", ")}]`);
+  } catch (err) {
+    console.error("[skill-router] 检索失败:", err);
+  }
+};
+```
+
+> **注意**：将 `AGENT_NAME` 替换为你在 `openclaw.json` 中配置的 Agent 名称。
+
+### 第八步：注册并启用 Hook
+
+在 OpenClaw 配置文件（`/projects/.openclaw/openclaw.json`）中，为 hooks 添加自定义目录：
+
+```json
+{
+  "hooks": {
+    "internal": {
+      "load": {
+        "extraDirs": ["~/workspace/hooks"]
+      }
+    }
+  }
+}
+```
+
+然后启用 Hook 并重启：
+
+```bash
+openclaw hooks enable skill-router
+# 预期：✓ Enabled hook: 🧭 skill-router
+
+openclaw hooks list
+
+openclaw gateway restart
+```
+
+---
+
+## 验证部署
+
+发送一条测试消息，观察 Gateway 日志中是否出现：
+
+```
+[skill-router] 已更新 Skills: [github, weather, ...]
+```
+
+也可以用 cos-vectors-skill 直接查询向量桶，确认向量数据完整：
+
+> 请用 cos-vectors-skill 查询 `skill-index-768` 中与"帮我查代码"最相近的 3 个向量。
+
+---
+
+## 日常维护
+
+### 新装 Skill 后更新索引
+
+```bash
+python3 ~/workspace/scripts/build_skill_index.py
+```
+
+新 Skill 会被增量写入向量桶（key 不重复则自动覆盖更新）。
+
+### 手动测试检索效果
+
+```bash
+python3 ~/workspace/scripts/retrieve_skills.py "你的查询" --top-k=5
+```
+
+### 通过 cos-vectors-skill 查看索引状态
+
+> 请用 cos-vectors-skill 列出 `<your-bucket>` 中 `skill-index-768` 索引的所有向量 key。
+
+### 清空并重建索引
+
+> 请用 cos-vectors-skill 删除 `<your-bucket>` 中 `skill-index-768` 的所有向量。
+
+然后重跑构建脚本：
+
+```bash
+python3 ~/workspace/scripts/build_skill_index.py
+```
+
+### 调整距离阈值
+
+在 `handler.ts` 和 `retrieve_skills.py` 中同时修改 `DISTANCE_THRESHOLD`，然后重启 Gateway：
+
+```bash
+openclaw gateway restart
+```
+
+### 关键文件路径
+
+| 文件 | 路径 |
+|------|------|
+| cos-vectors-skill | `/usr/local/lib/.nvm/.../openclaw/skills/tencent/cos-vector-skill/` |
+| Hook 目录 | `~/workspace/hooks/skill-router/` |
+| 离线构建脚本 | `~/workspace/scripts/build_skill_index.py` |
+| 在线检索脚本 | `~/workspace/scripts/retrieve_skills.py` |
+| OpenClaw 配置 | `/projects/.openclaw/openclaw.json` |
+| 模型缓存 | `~/.cache/huggingface/hub/models--shibing624--text2vec-base-chinese/` |
+
+---
+
+## 让 OpenClaw 自动完成部署（一键指令）
+
+将以下内容发给 OpenClaw，填入你自己的参数，它会全程自动搞定：
+
+---
+
+> 请帮我部署 Skill 语义检索功能（skill-router），完整步骤如下：
+>
+> **参数配置：**
+> - 腾讯云 SecretId：`<你的SecretId>`
+> - 腾讯云 SecretKey：`<你的SecretKey>`
+> - COS Bucket 名称：`<your-bucket-1234567890>`
+> - COS Region：`<ap-guangzhou>`
+> - 向量 Index 名：`skill-index-768`
+> - Agent 名称：`<你的Agent名称>`（即 openclaw.json 中 agents.list 里的 name）
+>
+> **请按顺序执行：**
+> 1. 安装 cos-vectors-skill：从 `https://clawhub.ai/jimmyyan/cos-vectors-skill` 安装，如果失败:尝试从skillhub安装，先安装skillhub: curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh | bash，再安装cos-vectors-skill: skillhub install cos-vectors-skill
+> 2. 用 cos-vectors-skill 在指定 Bucket 创建向量索引 `skill-index-768`（维度 768，cosine 距离）
+> 3. 运行 `pip3 install "sentence-transformers[onnx]" cos-python-sdk-v5` 安装依赖
+> 4. 下载 text2vec-base-chinese 模型（via hf-mirror.com）
+> 5. 创建目录 `~/workspace/scripts/` 和 `~/workspace/hooks/skill-router/`
+> 6. 将 `build_skill_index.py`、`retrieve_skills.py`、`HOOK.md`、`handler.ts` 按文档保存到对应路径，替换配置参数
+> 7. 运行 `build_skill_index.py` 建立向量索引；用 cos-vectors-skill 验证向量数量
+> 8. 在 `openclaw.json` 的 hooks.internal.load.extraDirs 中添加 `~/workspace/hooks`
+> 9. 运行 `openclaw hooks enable skill-router`，然后 `openclaw gateway restart`
+> 10. 验证：运行 `retrieve_skills.py "查天气"` 确认返回合理结果
+>
+> 脚本内容参考本文档中的完整代码。
+
+---
+
+## 常见问题
+
+**Q：向量桶维度为什么是 768，不是 1024？**
+A：本方案使用本地 `text2vec-base-chinese` 模型，输出维度为 768。
+创建向量索引时维度必须填 `768`，与模型输出一致。
+
+**Q：cos-vectors-skill 和 build_skill_index.py 的关系是什么？**
+A：两者使用完全相同的 COS Vectors API（`put_vectors`、`query_vectors` 等）。
+cos-vectors-skill 封装了对话式操作入口，方便在 OpenClaw 中通过自然语言管理向量桶；
+`build_skill_index.py` 是批量写入的离线脚本，直接调用相同的底层 SDK。
+
+**Q：PyTorch 方式加载模型有什么问题？**
+A：PyTorch 方式加载 `text2vec-base-chinese` 耗时较长（>10 秒），在 OpenClaw exec 环境中可能因超时被 SIGTERM 杀掉。使用 ONNX 量化版（`model_qint8_avx512_vnni.onnx`）推理约 1~2 秒，稳定可靠。
+
+**Q：distance 阈值 0.72 怎么来的？**
+A：实测纯聊天类查询（如"你好"）命中最近 Skill 的距离约为 0.64，工具类查询通常 < 0.5。0.72 是一个较宽松的边界，实际使用中可根据效果下调至 0.65 左右。
+
+**Q：安装新 Skill 后检索不到？**
+A：重跑 `build_skill_index.py` 即可，新 Skill 会被增量写入。
+也可以用 cos-vectors-skill 确认新 Skill 的向量是否已存在于索引中。
+
+**Q：Hook 修改 config 后需要手动重载吗？**
+A：不需要。`handler.ts` 中的 `kill -USR1` 会触发 OpenClaw Gateway 的 SIGUSR1 热重载，自动生效。
+
+---
+
+## 参考资料
+
+- [cos-vectors-skill（ClawHub）](https://clawhub.ai/jimmyyan/cos-vectors-skill)
+- [COS 向量检索文档](https://cloud.tencent.com/document/product/436/100411)
+- [sentence-transformers ONNX 文档](https://sbert.net/docs/package_reference/SentenceTransformer.html)
+- [text2vec-base-chinese 模型](https://huggingface.co/shibing624/text2vec-base-chinese)
+- [cos-python-sdk-v5](https://github.com/tencentyun/cos-python-sdk-v5)
+- [OpenClaw Hooks 文档](https://docs.openclaw.ai)
