@@ -32,12 +32,12 @@
 
 | 文档 | 说明 |
 |------|------|
-| [docs/skill-semantic-search-guide.md](docs/skill-semantic-search-guide.md) | OpenClaw Skill 语义检索复现指南，基于向量桶实现 Skill 动态路由 |
+| [docs/skill-semantic-search-guide.md](docs/skill-semantic-search-guide.md) | OpenClaw Skill 语义检索操作指南，基于向量桶实现 Skill 动态路由 |
 
 ## 相关链接
 
 - [向量桶产品概述（官网）](https://cloud.tencent.com/document/product/436/126985)
-- [COS 向量检索 API 文档](https://cloud.tencent.com/document/product/436/100411)
+- [COS 向量检索 API 文档](https://cloud.tencent.com/document/product/436/127709)
 - [腾讯云 COS 控制台](https://console.cloud.tencent.com/cos)
 - [cos-python-sdk-v5（Python SDK）](https://github.com/tencentyun/cos-python-sdk-v5)
 
